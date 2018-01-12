@@ -1,5 +1,6 @@
 from __future__ import absolute_import
 import time
+import hashlib
 
 import numpy as nm
 import warnings
@@ -27,6 +28,39 @@ def solve(mtx, rhs, solver_class=None, solver_conf=None):
     solution = solver(rhs)
 
     return solution
+
+def _get_cs_matrix_hash(mtx, chunk_size=100000):
+    def _gen_array_chunks(arr):
+        ii = 0
+        while len(arr[ii:]):
+            yield arr[ii:ii+chunk_size].tobytes()
+            ii += chunk_size
+
+    sha1 = hashlib.sha1()
+    for chunk in _gen_array_chunks(mtx.indptr):
+        sha1.update(chunk)
+    for chunk in _gen_array_chunks(mtx.indices):
+        sha1.update(chunk)
+    for chunk in _gen_array_chunks(mtx.data):
+        sha1.update(chunk)
+
+    digest = sha1.hexdigest()
+    return digest
+
+def _is_new_matrix(mtx, mtx_digest, force_reuse=False):
+    if not isinstance(mtx, sps.csr_matrix):
+        return True, mtx_digest
+
+    if force_reuse:
+        return False, mtx_digest
+
+    id0, digest0 = mtx_digest
+    id1 = id(mtx)
+    digest1 = _get_cs_matrix_hash(mtx)
+    if (id1 == id0) and (digest1 == digest0):
+        return False, (id1, digest1)
+
+    return True, (id1, digest1)
 
 def standard_call(call):
     """
@@ -117,7 +151,7 @@ class ScipyDirect(LinearSolver):
     ]
 
     def __init__(self, conf, **kwargs):
-        LinearSolver.__init__(self, conf, mtx_id=None, solve=None, **kwargs)
+        LinearSolver.__init__(self, conf, solve=None, **kwargs)
         um = self.sls = None
 
         aux = try_imports(['import scipy.linsolve as sls',
@@ -164,9 +198,10 @@ class ScipyDirect(LinearSolver):
             return self.sls.spsolve(mtx, rhs)
 
     def presolve(self, mtx):
-        if self.mtx_id != id(mtx):
+        is_new, mtx_digest = _is_new_matrix(mtx, self.mtx_digest)
+        if is_new:
             self.solve = self.sls.factorized(mtx)
-            self.mtx_id = id(mtx)
+            self.mtx_digest = mtx_digest
 
 class ScipyIterative(LinearSolver):
     """
@@ -308,6 +343,9 @@ class PyAMGSolver(LinearSolver):
          'The maximum number of iterations.'),
         ('eps_r', 'float', 1e-8, False,
          'The relative tolerance for the residual.'),
+        ('force_reuse', 'bool', False, False,
+         """If True, skip the check whether the MG solver object corresponds
+            to the `mtx` argument: it is always reused."""),
         ('*', '*', None, False,
          """Additional parameters supported by the method. Use the 'method:'
             prefix for arguments of the method construction function
@@ -326,7 +364,7 @@ class PyAMGSolver(LinearSolver):
             msg =  'cannot import pyamg!'
             raise ImportError(msg)
 
-        LinearSolver.__init__(self, conf, mtx_id=None, mg=None, **kwargs)
+        LinearSolver.__init__(self, conf, mg=None, **kwargs)
 
         try:
             solver = getattr(pyamg, self.conf.method)
@@ -365,12 +403,14 @@ class PyAMGSolver(LinearSolver):
             # Call an optional user-defined callback.
             callback(sol)
 
-        if self.mtx_id != id(mtx):
+        is_new, mtx_digest = _is_new_matrix(mtx, self.mtx_digest,
+                                            force_reuse=conf.force_reuse)
+        if is_new or (self.mg is None):
             _kwargs = {key[7:] : val
                        for key, val in six.iteritems(solver_kwargs)
                        if key.startswith('method:')}
             self.mg = self.solver(mtx, **_kwargs)
-            self.mtx_id = id(mtx)
+            self.mtx_digest = mtx_digest
 
         _kwargs = {key[6:] : val
                    for key, val in six.iteritems(solver_kwargs)
@@ -422,7 +462,7 @@ class PyAMGKrylovSolver(LinearSolver):
             msg =  'cannot import pyamg.krylov!'
             raise ImportError(msg)
 
-        LinearSolver.__init__(self, conf, mtx_id=None, mg=None,
+        LinearSolver.__init__(self, conf, mg=None,
                               context=context, **kwargs)
 
         try:
@@ -529,6 +569,12 @@ class PETScKrylovSolver(LinearSolver):
          'The relative tolerance for the residual.'),
         ('eps_d', 'float', 1e5, False,
          'The divergence tolerance for the residual.'),
+        ('force_reuse', 'bool', False, False,
+         """If True, skip the check whether the KSP solver object corresponds
+            to the `mtx` argument: it is always reused."""),
+        ('*', '*', None, False,
+         """Additional parameters supported by the method. Can be used to pass
+            all PETSc options supported by :func:`petsc.Options()`."""),
     ]
 
     _precond_sides = {None : None, 'left' : 0, 'right' : 1, 'symmetric' : 2}
@@ -546,7 +592,7 @@ class PETScKrylovSolver(LinearSolver):
 
         LinearSolver.__init__(self, conf, petsc=petsc, comm=comm,
                               converged_reasons=converged_reasons,
-                              fields=None, mtx_id=0, ksp=None, pmtx=None,
+                              fields=None, ksp=None, pmtx=None,
                               context=context, **kwargs)
 
     def set_field_split(self, field_ranges, comm=None):
@@ -568,10 +614,13 @@ class PETScKrylovSolver(LinearSolver):
                                                     comm=comm)
             self.fields.append((key, field_is))
 
-    def create_ksp(self, comm=None):
+    def create_ksp(self, options=None, comm=None):
         optDB = self.petsc.Options()
 
         optDB['sub_pc_type'] = self.conf.sub_precond
+        if options is not None:
+            for key, val in six.iteritems(options):
+                optDB[key] = val
 
         ksp = self.petsc.KSP()
         ksp.create(comm)
@@ -616,19 +665,23 @@ class PETScKrylovSolver(LinearSolver):
     def __call__(self, rhs, x0=None, conf=None, eps_a=None, eps_r=None,
                  i_max=None, mtx=None, status=None, comm=None, context=None,
                  **kwargs):
+        solver_kwargs = self.build_solver_kwargs(conf)
+
         eps_a = get_default(eps_a, self.conf.eps_a)
         eps_r = get_default(eps_r, self.conf.eps_r)
         i_max = get_default(i_max, self.conf.i_max)
         eps_d = self.conf.eps_d
 
-        if self.mtx_id == id(mtx):
+        is_new, mtx_digest = _is_new_matrix(mtx, self.mtx_digest,
+                                            force_reuse=conf.force_reuse)
+        if (not is_new) and self.ksp is not None:
             ksp = self.ksp
             pmtx = self.pmtx
 
         else:
             pmtx = self.create_petsc_matrix(mtx, comm=comm)
 
-            ksp = self.create_ksp(comm=comm)
+            ksp = self.create_ksp(options=solver_kwargs, comm=comm)
             ksp.setOperators(pmtx)
             ksp.setTolerances(atol=eps_a, rtol=eps_r, divtol=eps_d,
                               max_it=i_max)
@@ -638,7 +691,7 @@ class PETScKrylovSolver(LinearSolver):
                 ksp.pc.setPythonContext(setup_precond(mtx, context))
 
             ksp.setFromOptions()
-            self.mtx_id = id(mtx)
+            self.mtx_digest = mtx_digest
             self.ksp = ksp
             self.pmtx = pmtx
 
